@@ -184,6 +184,7 @@ class GalaxyRole(object):
                     temp_file.write(data)
                     data = url_file.read()
                 temp_file.close()
+                display.debug("File was fetched.")
                 return temp_file.name
             except Exception as e:
                 display.error("failed to download the file: %s" % str(e))
@@ -240,6 +241,7 @@ class GalaxyRole(object):
                     if role_versions and str(self.version) not in [a.get('name', None) for a in role_versions]:
                         raise AnsibleError("- the specified version (%s) of %s was not found in the list of available versions (%s)." % (self.version, self.name, role_versions))
 
+                display.debug(dir(role_data))
                 tmp_file = self.fetch(role_data)
 
         else:
@@ -328,6 +330,90 @@ class GalaxyRole(object):
                     except (OSError,IOError) as e:
                         display.warning("Unable to remove tmp file (%s): %s" % (tmp_file, str(e)))
                 return True
+
+        return False
+
+    def download(self):
+        if self.scm:
+            # create tar file from scm url
+            tmp_file = RoleRequirement.scm_archive_role(**self.spec)
+        elif self.src:
+            if '://' in self.src:
+                role_data = self.src
+                tmp_file = self.fetch(role_data)
+            else:
+                api = GalaxyAPI(self.galaxy)
+                role_data = api.lookup_role_by_name(self.src)
+                if not role_data:
+                    raise AnsibleError("- sorry, %s was not found on %s." % (self.src, api.api_server))
+
+                if role_data.get('role_type') == 'CON':
+                    # Container Enabled
+                    display.warning("%s is a Container Enabled role and should only be installed using "
+                                    "Ansible Container" % self.name)
+
+                if role_data.get('role_type') == 'APP':
+                    # Container Role
+                    display.warning("%s is a Container App role and should only be installed using Ansible "
+                                    "Container" % self.name)
+
+                role_versions = api.fetch_role_related('versions', role_data['id'])
+                if not self.version:
+                    # convert the version names to LooseVersion objects
+                    # and sort them to get the latest version. If there
+                    # are no versions in the list, we'll grab the head
+                    # of the master branch
+                    if len(role_versions) > 0:
+                        loose_versions = [LooseVersion(a.get('name',None)) for a in role_versions]
+                        loose_versions.sort()
+                        self.version = str(loose_versions[-1])
+                    elif role_data.get('github_branch', None):
+                        self.version = role_data['github_branch']
+                    else:
+                        self.version = 'master'
+                elif self.version != 'master':
+                    if role_versions and str(self.version) not in [a.get('name', None) for a in role_versions]:
+                        raise AnsibleError("- the specified version (%s) of %s was not found in the list of available versions (%s)." % (self.version, self.name, role_versions))
+
+                tmp_file = self.fetch(role_data)
+
+        else:
+           raise AnsibleError("No valid role data found")
+
+
+        if tmp_file:
+            local_path = "%s.%s.tar.gz" % (self.name, self.version)
+            try:
+                os.rename(tmp_file, local_path)
+            except (OSError,IOError) as e:
+                display.warning("Unable to move tmp file (%s) to (%s): %s" % (tmp_file, local_path, str(e)))
+                return False
+            display.display("Downloaded %s to %s" % (tmp_file, local_path))
+
+            if not tarfile.is_tarfile(local_path):
+                raise AnsibleError("the file downloaded was not a tar.gz")
+            else:
+                if tmp_file.endswith('.gz'):
+                    role_tar_file = tarfile.open(local_path, "r:gz")
+                else:
+                    role_tar_file = tarfile.open(local_path, "r")
+                # verify the role's meta file
+                meta_file = None
+                members = role_tar_file.getmembers()
+                # next find the metadata file
+                for member in members:
+                    if self.META_MAIN in member.name:
+                        meta_file = member
+                        break
+                if not meta_file:
+                    raise AnsibleError("this role does not appear to have a meta/main.yml file.")
+                else:
+                    try:
+                        self._metadata = yaml.safe_load(role_tar_file.extractfile(meta_file))
+                    except:
+                        raise AnsibleError("this role does not appear to have a valid meta/main.yml file.")
+
+            return True
 
         return False
 

@@ -52,7 +52,7 @@ except ImportError:
 class GalaxyCLI(CLI):
 
     SKIP_INFO_KEYS = ("name", "description", "readme_html", "related", "summary_fields", "average_aw_composite", "average_aw_score", "url" )
-    VALID_ACTIONS = ("delete", "import", "info", "init", "install", "list", "login", "remove", "search", "setup")
+    VALID_ACTIONS = ("delete", "download", "import", "info", "init", "install", "list", "login", "remove", "search", "setup")
 
     def __init__(self, args):
         self.api = None
@@ -76,6 +76,11 @@ class GalaxyCLI(CLI):
         # specific to actions
         if self.action == "delete":
             self.parser.set_usage("usage: %prog delete [options] github_user github_repo")
+        elif self.action == "download":
+            self.parser.set_usage("usage: %prog download [options] [-r FILE | role_name(s)[,version] | scm+role_repo_url[,version]]")
+            self.parser.add_option('-i', '--ignore-errors', dest='ignore_errors', action='store_true', default=False, help='Ignore errors and continue with the next specified role.')
+            self.parser.add_option('-n', '--no-deps', dest='no_deps', action='store_true', default=False, help='Don\'t download roles listed as dependencies')
+            self.parser.add_option('-r', '--role-file', dest='role_file', help='A file containing a list of roles to be downloaded')
         elif self.action == "import":
             self.parser.set_usage("usage: %prog import [options] github_user github_repo")
             self.parser.add_option('--no-wait', dest='wait', action='store_false', default=True, help='Don\'t wait for import results.')
@@ -403,6 +408,112 @@ class GalaxyCLI(CLI):
 
             if not installed:
                 display.warning("- %s was NOT installed successfully." % role.name)
+                self.exit_without_ignore()
+
+        return 0
+
+    def execute_download(self):
+        """
+        Executes the download action. The args list contains the roles to be
+        downloaded. The list of roles can be a name (which will be downloaded
+        via the galaxy API and github).
+        """
+
+        role_file  = self.get_opt("role_file", None)
+
+        if len(self.args) == 0 and role_file is None:
+            # the user needs to specify one of either --role-file
+            # or specify a single user/role name
+            raise AnsibleOptionsError("- you must specify a user/role name or a roles file")
+        elif len(self.args) == 1 and role_file is not None:
+            # using a role file is mutually exclusive of specifying
+            # the role name on the command line
+            raise AnsibleOptionsError("- please specify a user/role name, or a roles file, but not both")
+
+        no_deps    = self.get_opt("no_deps", False)
+        force      = self.get_opt('force', False)
+
+        roles_left = []
+        if role_file:
+            try:
+                f = open(role_file, 'r')
+                if role_file.endswith('.yaml') or role_file.endswith('.yml'):
+                    try:
+                        required_roles = yaml.safe_load(f.read())
+                    except Exception as e:
+                        raise AnsibleError("Unable to load data from the requirements file: %s" % role_file)
+
+                    if required_roles is None:
+                        raise AnsibleError("No roles found in file: %s" % role_file)
+
+                    for role in required_roles:
+                        if "include" not in role:
+                            role = RoleRequirement.role_yaml_parse(role)
+                            display.vvv("found role %s in yaml file" % str(role))
+                            if "name" not in role and "scm" not in role:
+                                raise AnsibleError("Must specify name or src for role")
+                            roles_left.append(GalaxyRole(self.galaxy, **role))
+                        else:
+                            with open(role["include"]) as f_include:
+                                try:
+                                    roles_left += [
+                                        GalaxyRole(self.galaxy, **r) for r in
+                                        map(RoleRequirement.role_yaml_parse,
+                                            yaml.safe_load(f_include))
+                                    ]
+                                except Exception as e:
+                                    msg = "Unable to load data from the include requirements file: %s %s"
+                                    raise AnsibleError(msg % (role_file, e))
+                else:
+                    display.deprecated("going forward only the yaml format will be supported")
+                    # roles listed in a file, one per line
+                    for rline in f.readlines():
+                        if rline.startswith("#") or rline.strip() == '':
+                            continue
+                        display.debug('found role %s in text file' % str(rline))
+                        role = RoleRequirement.role_yaml_parse(rline.strip())
+                        roles_left.append(GalaxyRole(self.galaxy, **role))
+                f.close()
+            except (IOError, OSError) as e:
+                display.error('Unable to open %s: %s' % (role_file, str(e)))
+        else:
+            # roles were specified directly, so we'll just go out grab them
+            # (and their dependencies, unless the user doesn't want us to).
+            for rname in self.args:
+                role = RoleRequirement.role_yaml_parse(rname.strip())
+                roles_left.append(GalaxyRole(self.galaxy, **role))
+
+        for role in roles_left:
+            display.vvv('Downloading role %s ' % role.name)
+            # query the galaxy API for the role data
+
+            try:
+                installed = role.download()
+            except AnsibleError as e:
+                display.warning("- %s was NOT downloaded successfully: %s " % (role.name, str(e)))
+                self.exit_without_ignore()
+                continue
+
+            # install dependencies, if we want them
+            if not no_deps and installed:
+                role_dependencies = role.metadata.get('dependencies') or []
+                for dep in role_dependencies:
+                    display.debug('Downloading dep %s' % dep)
+                    dep_req = RoleRequirement()
+                    dep_info = dep_req.role_yaml_parse(dep)
+                    dep_role = GalaxyRole(self.galaxy, **dep_info)
+                    if '.' not in dep_role.name and '.' not in dep_role.src and dep_role.scm is None:
+                        # we know we can skip this, as it's not going to
+                        # be found on galaxy.ansible.com
+                        continue
+                    if dep_role not in roles_left:
+                        display.display('- adding dependency: %s' % dep_role.name)
+                        roles_left.append(dep_role)
+                    else:
+                        display.display('- dependency %s already pending download.' % dep_role.name)
+
+            if not installed:
+                display.warning("- %s was NOT downloaded successfully." % role.name)
                 self.exit_without_ignore()
 
         return 0
